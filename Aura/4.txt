@@ -1,0 +1,1284 @@
+ПОЛНАЯ ДОКУМЕНТАЦИЯ СИСТЕМЫ KILLAURA ДЛЯ ПОРТА НА 1.21.1
+1. АРХИТЕКТУРА СИСТЕМЫ
+Основные компоненты:
+AttackAura.java - главный класс координации
+UAura.java - логика атаки и bypass техник
+URotate.java - система расчета ротаций
+TargetComponent.java - система выбора цели
+UBoxPoints.java - мультипоинты на хитбоксе
+RayTraceUtil.java - raycast проверки
+SensUtil.java - GCD патч для обхода
+RotationComponent.java - применение ротации к игроку
+2. ГЛАВНЫЙ КЛАСС AttackAura.java
+Импорты и зависимости:
+java
+// Lombok для генерации геттеров/сеттеров
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.experimental.Accessors;
+import lombok.experimental.FieldDefaults;
+ 
+// Minecraft классы
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.entity.player.AbstractClientPlayerEntity;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.network.play.client.CPlayerDiggingPacket;
+import net.minecraft.util.Direction;
+import net.minecraft.util.Hand;
+import net.minecraft.util.math.AxisAlignedBB;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.vector.Vector2f;
+import net.minecraft.util.math.vector.Vector3d;
+ 
+// OpenGL для рендера
+import org.lwjgl.glfw.GLFW;
+import org.lwjgl.opengl.GL11;
+ 
+// Анимации
+import org.sheluvparis.common.animation.Easings;
+ 
+// Event система
+import org.sheluvparis.common.events.orbit.EventHandler;
+import org.sheluvparis.excellent.client.events.player.ActionEvent;
+import org.sheluvparis.excellent.client.events.player.MovementInputKeysEvent;
+import org.sheluvparis.excellent.client.events.player.UpdateEvent;
+import org.sheluvparis.excellent.client.events.render.Render3DEvent;
+ 
+// Внутренние компоненты
+import org.sheluvparis.excellent.client.impl.component.impl.attackaura.UAura;
+import org.sheluvparis.excellent.client.impl.component.impl.attackaura.UBoxPoints;
+import org.sheluvparis.excellent.client.impl.component.impl.attackaura.URotate;
+import org.sheluvparis.excellent.client.impl.component.impl.rotation.Rotation;
+import org.sheluvparis.excellent.client.impl.component.impl.rotation.RotationComponent;
+import org.sheluvparis.excellent.client.impl.component.impl.target.TargetComponent;
+ 
+// Настройки
+import org.sheluvparis.excellent.client.impl.settings.impl.BooleanSetting;
+import org.sheluvparis.excellent.client.impl.settings.impl.ModeSetting;
+import org.sheluvparis.excellent.client.impl.settings.impl.SliderSetting;
+ 
+// Утилиты
+import org.sheluvparis.excellent.client.util.combat.AuraUtil;
+import org.sheluvparis.excellent.client.util.combat.RayTraceUtil;
+import org.sheluvparis.excellent.client.util.combat.SensUtil;
+import org.sheluvparis.excellent.client.util.math.Mathf;
+import org.sheluvparis.excellent.client.util.render.impl.RenderUtil3D;
+ 
+// Нейросеть для предсказания
+import org.sheluvparis.excellent.client.impl.neuro.AimPredictor;
+ 
+import java.security.SecureRandom;
+import java.util.Random;
+Настройки (Settings):
+java
+private final ModeSetting rotationModeImpl = new ModeSetting("Ротация", 
+    "Без ротации", "По умолчанию", "Матрикс", "Снапы", "Плавные снапы", 
+    "ФанТайм", "None", "Spookytime", "Cascade").set("Матрикс");
+ 
+private final BooleanSetting viewLock = new BooleanSetting("Поворачивать камеру", false);
+ 
+private final ModeSetting rangeModeImpl = new ModeSetting("Мод радиуса атаки", 
+    "Сильный античит", "NCP или аналоги", "Античит AAC", 
+    "Античит Matrix", "Слабый античит", "Свои настройки").set("Свои настройки");
+ 
+private final SliderSetting attackRange = new SliderSetting("Радиус атаки", 3.F, 1.F, 6.F, .1F);
+private final SliderSetting preRange = new SliderSetting("Доп. дистанция", .0F, 0.F, 3.F, .1F);
+private final BooleanSetting shieldBreaker = new BooleanSetting("Ломать щит", true);
+private final ModeSetting eatFixMode = new ModeSetting("При поедании", "Бить дальше", "Прекратить бить", "NCP обход").set("Бить дальше");
+private final ModeSetting stopSprint = new ModeSetting("Сброс спринта", "Никогда", "Незаметно", "Перед ударом", "Задолго до удара", "Сильно").set("Незаметно");
+public final BooleanSetting saveTarget = new BooleanSetting("Преследовать одного", true);
+public final ModeSetting cooldownMode = new ModeSetting("Комбат куллдаун", "1.8.9 или ниже", "1.9 или выше").set("1.9 или выше");
+public final BooleanSetting groundHitting = new BooleanSetting("Позволить комбить", true);
+public final BooleanSetting cpsBypass = new BooleanSetting("Обход CPS проверок", true);
+public final BooleanSetting renderBoxPoint = new BooleanSetting("Показать точку ротейта", true);
+public final BooleanSetting postMissSpamming = new BooleanSetting("Закликать при промахе", false);
+Главный цикл onUpdate():
+java
+@EventHandler
+@Compile
+private void onUpdate(UpdateEvent event) {
+    // 1. Расчет дистанций
+    float[] ranges = getRanges();
+    ranges = new float[]{ranges[0], ranges[1], ranges[0] + ranges[1]};
+    
+    // 2. Получение цели
+    target = TargetComponent.getTarget(ranges[2], saveTarget.get());
+    
+    // 3. Проверка цели
+    if (target == null || mc.world.getEntityByID(target.getEntityId()) == null) {
+        this.resetAllVectors();
+        return;
+    }
+    
+    // 4. Resolve всех игроков (для античита)
+    for (Entity entity : mc.world.getAllEntities()) {
+        if (entity instanceof AbstractClientPlayerEntity abstractClientPlayerEntity) {
+            abstractClientPlayerEntity.resolve();
+        }
+    }
+    
+    // 5. Расчет и применение ротации
+    if (elytraTarget.canTarget(target)) {
+        update(target); // Elytra режим
+    } else {
+        if (rotationModeImpl.is("Без ротации")) {
+            pro_rotation.rotatePrimitiveToSend(null);
+            this.resetAllVectors();
+        } else if (rotationModeImpl.is("ФанТайм")) {
+            funTimeRotation(); // Фан режим
+        } else {
+            // Обычные режимы ротации
+            final URotate.Vector3d2fRB rotationData = pro_rotation.updateRotationData(
+                rotationModeImpl.get(), 
+                lastHandledVectorToRotation == null ? 
+                    new Vector2f(mc.player.rotationYaw, mc.player.rotationPitch) : 
+                    lastHandledVectorToRotation, 
+                ranges[2]
+            );
+            if (rotationData.isToUse()) {
+                this.updateAllVectors(rotationData.getVec3d(), rotationData.getVec2f());
+                pro_rotation.rotatePrimitiveToSend(lastHandledVectorToRotation);
+            } else {
+                this.resetAllVectors();
+            }
+        }
+    }
+    
+    // 6. Anti-miss система
+    UAura.antiMissesHittingUpdate(target, cpsBypass.get(), this.isRayCastRuleToAttack(), postMissSpamming.get());
+    
+    // 7. Проверка возможности атаки
+    boolean canAttack = UAura.shouldAttack(target, this.isRayCastRuleToAttack(), 
+        !rotationModeImpl.is("ФанТайм"), cooldownMode.is("1.9 или выше"), 0L, ranges);
+    
+    // 8. Дополнительная проверка для ФанТайм
+    if (rotationModeImpl.is("ФанТайм")) {
+        canAttack = canAttack && anyEntityOnRay(target, lerpRotation.x, lerpRotation.y, ranges[2]);
+    }
+    
+    if (!canAttack) {
+        // Release всех игроков если нельзя атаковать
+        for (Entity entity : mc.world.getAllEntities()) {
+            if (entity instanceof AbstractClientPlayerEntity abstractClientPlayerEntity) {
+                abstractClientPlayerEntity.releaseResolver();
+            }
+        }
+        return;
+    }
+    
+    // 9. Проверка поедания
+    if (mc.player.isEating()) {
+        if (eatFixMode.is("Прекратить бить")) return;
+        else if (eatFixMode.is("NCP обход"))
+            new CPlayerDiggingPacket(CPlayerDiggingPacket.Action.RELEASE_USE_ITEM, 
+                new BlockPos(-1, -1, -1), Direction.DOWN).sendSilent();
+    }
+    
+    // 10. Подготовка bypass задач
+    final Runnable[]
+        shieldBreak = UAura.hitShieldBreakTaskForUse(target, shieldBreaker.get()),
+        shieldPressBypass = UAura.resetShieldSilentTaskForUse(true),
+        skipSilentSprint = UAura.skipSilentSprintingTaskForUse(!stopSprint.is("Никогда"));
+    
+    final Runnable preHitSendCodeSingleTick = () -> {
+        skipSilentSprint[0].run();
+        shieldPressBypass[0].run();
+        shieldBreak[0].run();
+    };
+    
+    final Runnable postHitSendCodeSingleTick = () -> {
+        shieldBreak[1].run();
+        shieldPressBypass[1].run();
+        skipSilentSprint[1].run();
+    };
+    
+    // 11. Выполнение атаки
+    UAura.useEntity(target, preHitSendCodeSingleTick, postHitSendCodeSingleTick, Hand.MAIN_HAND, cpsBypass.get());
+    
+    // 12. Release всех игроков после атаки
+    for (Entity entity : mc.world.getAllEntities()) {
+        if (entity instanceof AbstractClientPlayerEntity abstractClientPlayerEntity) {
+            abstractClientPlayerEntity.releaseResolver();
+        }
+    }
+}
+Расчет дистанций getRanges():
+java
+public float[] getRanges() {
+    ElytraTarget elytraTarget = Client.inst().featureManager().elytraTarget();
+    if (mc.player.isElytraFlying() && elytraTarget.enabled()) {
+        float groundDistance = this.target != null ? 
+            (this.target.isElytraFlying() ? 6 : attackRange.get()) : attackRange.get();
+        return new float[]{groundDistance, 64F};
+    }
+    return switch (rangeModeImpl.get()) {
+        case "Сильный античит" -> new float[]{3.F, .4F};
+        case "NCP или аналоги" -> new float[]{4.05F, 2.7F};
+        case "Античит AAC" -> new float[]{3.56F, 1.15F};
+        case "Античит Matrix" -> new float[]{3.3F, .65F};
+        case "Слабый античит" -> new float[]{6.F, .0F};
+        case "Свои настройки" -> new float[]{attackRange.get(), preRange.get()};
+        default -> new float[]{3.F, .1F};
+    };
+}
+3. ЛОГИКА АТАКИ И BYPASS - UAura.java
+Импорты:
+java
+import lombok.Getter;
+import net.minecraft.block.material.Material;
+import net.minecraft.client.Minecraft;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.ai.attributes.Attributes;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.item.AxeItem;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.network.play.client.CEntityActionPacket;
+import net.minecraft.network.play.client.CHeldItemChangePacket;
+import net.minecraft.network.play.client.CPlayerDiggingPacket;
+import net.minecraft.network.play.client.CPlayerTryUseItemPacket;
+import net.minecraft.potion.Effects;
+import net.minecraft.tags.FluidTags;
+import net.minecraft.util.Direction;
+import net.minecraft.util.Hand;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.RayTraceContext;
+import net.minecraft.util.math.RayTraceResult;
+import net.minecraft.util.math.vector.Vector3d;
+import net.minecraft.world.World;
+ 
+import java.security.SecureRandom;
+import java.util.Arrays;
+CPS Bypass система:
+java
+public static long hitCounterCPSBypass;
+ 
+public static void hitCounterCPSBypassNext() {
+    ++hitCounterCPSBypass;
+}
+ 
+public static void hitCounterCPSBypassReset() {
+    hitCounterCPSBypass = 0;
+}
+ 
+public static boolean cpsBypassTrigger() {
+    return hitCounterCPSBypass % 7 == 3; // Каждый 7-й удар (3-й в цикле)
+}
+Расчет кулдауна:
+java
+private static final StopWatch cooldownTimer = new StopWatch();
+ 
+public static long getMsCooldown() {
+    long msCooldown;
+    if (Client.inst().featureManager().attackAura.cooldownMode.is("1.9 или выше")) {
+        // 1.9+ combat system - основано на атрибуте ATTACK_SPEED
+        double attributeAttackSpeed = mc.player.getAttributeValue(Attributes.ATTACK_SPEED);
+        float maxDeviation = .2F;
+        msCooldown = (long) ((1.F / attributeAttackSpeed) * 1000.F * (1.F - Math.min(maxDeviation, 1.F)));
+        
+        // Special case для определенных значений скорости
+        if (attributeAttackSpeed == 4.D || attributeAttackSpeed == 4.4000000059604645 || 
+            attributeAttackSpeed == 4.800000011920929)
+            msCooldown = 450L;
+        
+        msCooldown = Math.max(msCooldown, 450L);
+    } else {
+        msCooldown = 45L; // 1.8 combat system
+    }
+    
+    // CPS bypass - добавляет 50ms к каждому 7-му удару
+    if (UAura.cpsBypassTrigger()) msCooldown += 50L;
+    
+    return msCooldown;
+}
+Shield Break bypass:
+java
+public static Runnable[] hitShieldBreakTaskForUse(LivingEntity livingIn, boolean enabled) {
+    final Runnable[] pre$post = new Runnable[] {() -> {}, () -> {}};
+    if (!enabled) return pre$post;
+    
+    // Проверка если цель смотрит в другую сторону (щит спереди)
+    if (livingIn instanceof PlayerEntity player && 
+        Math.abs(MathHelper.wrapDegrees(mc.player.rotationYaw - player.rotationYaw - 180)) > 90) {
+        
+        final ItemStack main = player.getHeldItemMainhand(), off = player.getHeldItemOffhand();
+        if (main != null && off != null) {
+            final Item mainItem = main.getItem(), offItem = off.getItem();
+            if (mainItem == Items.SHIELD || offItem == Items.SHIELD) {
+                final int slot, handSlot = mc.player.inventory.currentItem;
+                if ((slot = getAxeSlot()) != -1 && slot != handSlot) {
+                    // Pre: сменить на топор
+                    pre$post[0] = () -> new CHeldItemChangePacket(slot).sendSilent();
+                    // Post: вернуть слот
+                    pre$post[1] = () -> new CHeldItemChangePacket(handSlot).sendSilent();
+                }
+            }
+        }
+    }
+    return pre$post;
+}
+ 
+public static int getAxeSlot() {
+    for (int i = 0; i < 9; i++) 
+        if (mc.player.inventory.mainInventory.get(i).getItem() instanceof AxeItem) 
+            return i;
+    return -1;
+}
+Shield unblock bypass:
+java
+public static Runnable[] resetShieldSilentTaskForUse(boolean enabled) {
+    final Runnable[] pre$post = new Runnable[] {() -> {}, () -> {}};
+    if (!enabled) return pre$post;
+    
+    if (mc.player.isActiveItemStackBlocking()) {
+        Hand active = mc.player.getActiveHand();
+        if (active == null) return pre$post;
+        
+        // Pre: отпустить щит
+        pre$post[0] = () -> new CPlayerDiggingPacket(
+            CPlayerDiggingPacket.Action.RELEASE_USE_ITEM, 
+            BlockPos.ZERO, Direction.DOWN).sendSilent();
+        
+        // Post: снова поднять щит
+        pre$post[1] = () -> new CPlayerTryUseItemPacket(active).sendSilent();
+    }
+    return pre$post;
+}
+Sprint reset bypass:
+java
+public static Runnable[] skipSilentSprintingTaskForUse(boolean enabled) {
+    final Runnable[] pre$post = new Runnable[] {() -> {}, () -> {}};
+    if (!enabled) return pre$post;
+    
+    if (mc.player.isServerSprintState() && !mc.player.isOnGround() && 
+        !mc.player.areEyesInFluid(FluidTags.WATER)) {
+        
+        pre$post[0] = () -> {
+            mc.player.setSprinting(false);
+            mc.player.connection.sendPacket(new CEntityActionPacket(
+                mc.player, CEntityActionPacket.Action.STOP_SPRINTING));
+        };
+        
+        pre$post[1] = () -> {
+            mc.player.setSprinting(true);
+            mc.player.connection.sendPacket(new CEntityActionPacket(
+                mc.player, CEntityActionPacket.Action.START_SPRINTING));
+        };
+    }
+    return pre$post;
+}
+Проверка момента для крита:
+java
+public static boolean isBestMomentToHit(boolean fallCheck) {
+    if (!fallCheck) return true;
+    
+    float adaptiveFallValue = 0.F, maxFallOff = .2F;
+    
+    // CPS bypass - иногда игнорирует проверку падения
+    if (cpsBypassTrigger() && UAura.getYCapacityOnPlayerPos(2) > .20000004768371582D) {
+        adaptiveFallValue = maxFallOff;
+    }
+    
+    final boolean hasFall = UAura.convenientFallOffset() > adaptiveFallValue || 
+                          UAura.getYCapacityOnPlayerPos(2) < .1F;
+    
+    if (hasFall) return true;
+    
+    // Проверка жидкостей
+    final boolean badLiquidMoment = !mc.player.movementInput.jump && 
+        (mc.player.isInWater() || mc.player.isInLava()) || 
+        mc.player.areEyesInFluid(FluidTags.WATER) || 
+        mc.player.areEyesInFluid(FluidTags.LAVA) || 
+        mc.player.isMaterialInBB(Material.WEB);
+    
+    // Пропуск проверки падения в определенных условиях
+    final boolean skipFallCheck =
+        badLiquidMoment ||
+        (!mc.player.movementInput.jump && mc.player.ticksOnGround > 6) && 
+            Client.inst().featureManager().attackAura.groundHitting().get() ||
+        mc.player.isOnLadder() ||
+        mc.player.isElytraFlying() ||
+        mc.player.isRidingHorse() ||
+        mc.player.isPotionActive(Effects.BLINDNESS) || 
+        mc.player.isPotionActive(Effects.LEVITATION) || 
+        mc.player.isPotionActive(Effects.SLOW_FALLING) ||
+        mc.player.abilities.isFlying ||
+        mc.player.getPosY() < -64.D;
+    
+    return skipFallCheck;
+}
+Выполнение атаки:
+java
+public static boolean useEntity(LivingEntity livingIn, Runnable preHit, Runnable postHit, Hand hand, boolean cpsBypass) {
+    if (preHit != null) preHit.run();
+    
+    if (livingIn != null) {
+        assert mc.playerController != null;
+        mc.playerController.attackEntity(mc.player, livingIn);
+        
+        if (cpsBypass) hitCounterCPSBypassNext();
+        else hitCounterCPSBypassReset();
+        
+        cooldownTimer.reset();
+        
+        if (hand != null) mc.player.swingArm(hand);
+    }
+    
+    if (postHit != null) postHit.run();
+    
+    return livingIn != null;
+}
+Проверка возможности атаки:
+java
+public static boolean shouldAttack(LivingEntity livingTarget, boolean rayCast, boolean distanceCheck, boolean fallCheck, long cooldownMSOffset, float[] ranges) {
+    // Проверка дистанции
+    if (distanceCheck && livingTarget != null && !mc.player.validDistance(livingTarget, ranges[0], true))
+        return false;
+    
+    // Проверка кулдауна
+    if (!UAura.msCooldownReached(cooldownMSOffset)) return false;
+    
+    // Проверка момента для крита
+    boolean validNext = UAura.isBestMomentToHit(fallCheck);
+    
+    // Raycast проверка
+    if (validNext && rayCast && !anyEntityOnRay(livingTarget, ranges[0]))
+        validNext = false;
+    
+    return validNext;
+}
+Anti-miss система:
+java
+private static boolean missDetected;
+private static int counterTo0PostMissHits;
+ 
+private static int maxHitsCountOnMiss() {
+    return 3;
+}
+ 
+public static void antiMissesHittingUpdate(LivingEntity targetIn, boolean cpsBypass, boolean rayCastCheck, boolean enabled) {
+    if (targetIn == null || counterTo0PostMissHits == 0 || !enabled || targetIn.hurtTime != 0)
+        antiMissesHittingReset();
+    
+    if (enabled && targetIn != null && UAura.msCooldownHasMs(cpsBypassTrigger() ? 250 : 150) && mc.player.isSwingInProgress) {
+        // Обнаружение промаха: игрок свингает, но цель не получила урон
+        if (!missDetected && counterTo0PostMissHits == 0 && targetIn.hurtTime == 0) {
+            missDetected = true;
+            counterTo0PostMissHits = maxHitsCountOnMiss();
+        }
+        
+        // Закликивание при промахе
+        if (missDetected && counterTo0PostMissHits > 0 && targetIn != null) {
+            if ((!rayCastCheck || anyEntityOnRay(targetIn, 6.F)) && 
+                useEntity(targetIn, () -> {}, () -> {}, Hand.MAIN_HAND, cpsBypass)) 
+                --counterTo0PostMissHits;
+        }
+    }
+}
+4. СИСТЕМА ВЫБОРА ЦЕЛИ - TargetComponent.java
+Импорты:
+java
+import lombok.Getter;
+import lombok.experimental.Accessors;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.MobEntity;
+import net.minecraft.entity.item.ArmorStandEntity;
+import net.minecraft.entity.passive.AnimalEntity;
+import net.minecraft.entity.player.PlayerEntity;
+ 
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+Структура данных:
+java
+private static final List<Entity> entityList = Collections.synchronizedList(new ArrayList<>());
+private static int countLoadedEntities;
+private static final ExecutorService executorService = Executors.newSingleThreadExecutor();
+private static LivingEntity currentTarget;
+private static LivingEntity lastTarget;
+private static double lastRange = 0;
+Обновление списка энтити:
+java
+public static void updateTargetList() {
+    if (mc.world == null) {
+        synchronized (entityList) {
+            entityList.clear();
+        }
+        return;
+    }
+ 
+    List<Entity> entities = mc.world.loadedEntityList()
+            .stream()
+            .filter(entity -> entity != mc.player)
+            .toList();
+ 
+    synchronized (entityList) {
+        entityList.clear();
+        entityList.addAll(entities);
+    }
+}
+Фильтр энтити:
+java
+private static final Predicate<Entity> ENTITY_FILTER = TargetComponent::isValid;
+ 
+private static boolean isValid(final Entity entity) {
+    Targets module = Client.inst().featureManager().targets;
+    if (entity == null) return false;
+    if (entity instanceof FakePlayer) return false;
+    if (!module.throughWalls().get() && !mc.player.canEntityBeSeen(entity)) return false;
+    
+    if (entity instanceof LivingEntity living) {
+        if (living.getHealth() <= 0 || !entity.isAlive() || entity.equals(mc.player)) return false;
+    }
+    
+    if (entity instanceof ArmorStandEntity) return false;
+    
+    final MultiBooleanSetting setting = module.targets();
+    if (!setting.enabled("Невидимые") && entity.isInvisible()) return false;
+    
+    if (entity instanceof PlayerEntity player) {
+        if (Client.inst().featureManager().antiBot.isBot(player)) return false;
+        if (Client.inst().friendManager().isFriend(player.getGameProfile().getName())) return false;
+        if (!setting.enabled("Игроки")) return false;
+        if (!setting.enabled("Голые") && player.getTotalArmorValue() <= 0) return false;
+        if (!setting.enabled("Тиммейты") && mc.player.isOnSameTeam(entity)) return false;
+    }
+    
+    if (entity instanceof AnimalEntity) return setting.enabled("Животные");
+    if (entity instanceof MobEntity) return setting.enabled("Мобы");
+    
+    return true;
+}
+Получение списка целей:
+java
+public static List<LivingEntity> getTargets(final double range, boolean saveRange) {
+    if (countLoadedEntities != mc.world.getCountLoadedEntities()) {
+        executorService.execute(TargetComponent::updateTargetList);
+        countLoadedEntities = mc.world.getCountLoadedEntities();
+    }
+ 
+    if (currentTarget != null && !isValid(currentTarget)) {
+        currentTarget = null;
+    }
+    if (saveRange) lastRange = range;
+    
+    synchronized (entityList) {
+        List<LivingEntity> list = new ArrayList<>();
+        for (Entity entity : entityList) {
+            if (entity instanceof LivingEntity living && ENTITY_FILTER.test(entity)) {
+                if (mc.player.validDistance(entity, (float) range, true) && 
+                    mc.world.loadedLivingEntityList().contains(entity)) {
+                    list.add(living);
+                }
+            }
+        }
+        return list;
+    }
+}
+Получение цели с кешированием:
+java
+public static LivingEntity getTarget(final double range, boolean saveRange) {
+    // Проверка кешированной цели
+    if (currentTarget == null || !isValid(currentTarget) || 
+        !mc.player.validDistance(currentTarget, (float) range, true)) {
+        lastTarget = currentTarget = find(range, saveRange).orElse(null);
+    }
+    return currentTarget;
+}
+Сортировка целей:
+java
+private static Optional<LivingEntity> find(final double range, boolean saveRange) {
+    List<LivingEntity> validTargets = getTargets(range, saveRange);
+    final ModeSetting sortMode = Client.inst().featureManager().targets.sortMode();
+    
+    if (validTargets.isEmpty()) return Optional.empty();
+    
+    if (sortMode.is("Адаптивный")) {
+        // Приоритет: броня -> FOV -> дистанция -> здоровье
+        validTargets.sort(Comparator.comparingDouble(TargetComponent::compareArmor)
+                .thenComparingDouble(AuraUtil::calculateFOVFromCamera)
+                .thenComparingDouble(AuraUtil::getStrictDistance)
+                .thenComparingDouble(PlayerUtil::getEntityHealth));
+    } else if (sortMode.is("Дистанция")) {
+        validTargets.sort(Comparator.comparingDouble(mc.player::getDistance)
+                .thenComparingDouble(PlayerUtil::getEntityHealth));
+    } else if (sortMode.is("Здоровье")) {
+        validTargets.sort(Comparator.comparingDouble(PlayerUtil::getEntityHealth)
+                .thenComparingDouble(AuraUtil::getStrictDistance));
+    } else if (sortMode.is("Наводка")) {
+        validTargets.sort(Comparator.comparingDouble(AuraUtil::calculateFOVFromCamera)
+                .thenComparingDouble(AuraUtil::getStrictDistance)
+                .thenComparingDouble(PlayerUtil::getEntityHealth)
+                .thenComparingDouble(TargetComponent::compareArmor));
+    }
+    
+    return Optional.of(validTargets.get(0));
+}
+ 
+private static double compareArmor(LivingEntity entity) {
+    return (entity instanceof PlayerEntity player) ? 
+        -PlayerUtil.getEntityArmor(player) : -entity.getTotalArmorValue();
+}
+5. МУЛЬТИПОИНТЫ - UBoxPoints.java
+Импорты:
+java
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.entity.player.ClientPlayerEntity;
+import net.minecraft.entity.Entity;
+import net.minecraft.util.math.AxisAlignedBB;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.RayTraceContext;
+import net.minecraft.util.math.RayTraceResult;
+import net.minecraft.util.math.vector.Vector2f;
+import net.minecraft.util.math.vector.Vector3d;
+import org.sheluvparis.common.animation.Easings;
+ 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.stream.IntStream;
+Конвертация 3D точки в yaw/pitch:
+java
+public static Vector2f getVanillaRotate(Vector3d vec) {
+    final Vector3d eyesPos = mc.player.getEyePosition(mc.getRenderPartialTicks());
+    final Vector3d rot = vec.add(-eyesPos.x, -eyesPos.y, -eyesPos.z);
+    final double xzD = MathHelper.sqrt(rot.x * rot.x + rot.z * rot.z);
+    float yaw = (float) (Math.atan2(rot.z, rot.x) * 180.F / Math.PI - 90.F);
+    float pitch = (float) Math.toDegrees(-Math.atan2(rot.y, xzD));
+    return new Vector2f(yaw, pitch);
+}
+Raycast проверка видимости:
+java
+private static boolean seenOnceVector3d(ClientPlayerEntity self, Vector3d vec) {
+    Vector3d vector3d = new Vector3d(self.getPosX(), self.getPosYEye(), self.getPosZ());
+    return mc.world != null && traceBlock(vector3d, vec, 
+        RayTraceContext.BlockMode.COLLIDER, RayTraceContext.FluidMode.NONE).getType() != RayTraceResult.Type.BLOCK;
+}
+Генерация мультипоинтов:
+java
+public static List<Vector3d> entityBoxVec3dsAlternate(Entity entity, AxisAlignedBB aabb) {
+    if (entity == null) return null;
+    final List<Vector3d> vecs = new ArrayList<>();
+    
+    double offsetXYZ = .02F;
+    int maxPointsCountXZ = 14, minPointsCountXZ = 5;
+    int maxPointsCountY
+= 27, minPointsCountY = 9;
+
+double[] whh = new double[]{ entity.getWidth() - offsetXYZ * 2D, entity.getHeight() - offsetXYZ * 2D, (entity.getHeight() - offsetXYZ * 2D) / 1.05D };
+
+double[] xyz = new double[]{entity.getPosX(), entity.getPosY(), entity.getPosZ()};
+double[] xyz1 = new double[]{xyz[0] + whh[0] / 2.D, xyz[1] + whh[1], xyz[2] + whh[0] / 2.D};
+double[] xyz2 = new double[]{xyz[0] - whh[0] / 2.D, xyz[1], xyz[2] - whh[0] / 2.D};
+ 
+if (aabb != null) {
+    aabb = aabb.grow(-offsetXYZ);
+    whh = new double[]{
+        aabb.maxX - aabb.minX, 
+        aabb.maxY - aabb.minY, 
+        (aabb.maxY - aabb.minY) / 1.05D
+    };
+    xyz = new double[]{aabb.minX + whh[0] / 2.D, aabb.minY, aabb.minZ + whh[0] / 2.D};
+    xyz1 = new double[]{aabb.minX, aabb.minY, aabb.minZ};
+    xyz2 = new double[]{aabb.maxX, aabb.maxY, aabb.maxZ};
+}
+ 
+float sqrtWHH0CubeD2 = (float) Math.sqrt(whh[0] * whh[0] + whh[0] * whh[0] + whh[0] * whh[0]) / 2.F;
+final ClientPlayerEntity me = mc.player;
+if (me == null) return null;
+ 
+// Адаптивное количество точек на основе дистанции
+final float factorCount = (1.F - Math.min(me.getDistanceToCoord(xyz[0], xyz[1], xyz[2]) / 5.F, 1.F)) * 
+                          Math.min(me.getDistanceToCoord(xyz[0], me.getPosY(), xyz[2]) / .6F, 1.F);
+final int pointsCountXZ = lerp(minPointsCountXZ, maxPointsCountXZ, factorCount);
+final int pointsCountY = lerp(minPointsCountY, maxPointsCountY, factorCount);
+ 
+float scaleSeenCheck = .0F;
+ 
+// Тройной цикл генерации точек по осям
+int cIX = 0;
+for (final Integer xsI : IntStream.range(0, pointsCountXZ).toArray()) {
+    final boolean edgeX = xsI == 0 || xsI == pointsCountXZ - 1;
+    final double xs = lerp(xyz1[0], xyz2[0], xsI / (float) (pointsCountXZ - 1));
+    
+    for (final Integer zsI : IntStream.range(0, pointsCountXZ).toArray()) {
+        final boolean edgeZ = zsI == 0 || zsI == pointsCountXZ - 1;
+        final double zs = lerp(xyz1[2], xyz2[2], zsI / (float) (pointsCountXZ - 1));
+        
+        for (final Integer ysI : IntStream.range(0, pointsCountY).toArray()) {
+            final boolean edgeY = ysI == 0 || ysI == pointsCountY - 1;
+            final double ys = lerp(xyz1[1], xyz2[1], ysI / (float) (pointsCountY - 1));
+            final Vector3d vec = new Vector3d(xs, ys, zs);
+            
+            // Фильтрация: только края хитбокса или видимые точки
+            if (!edgeX && !edgeZ && !edgeY || 
+                me.getDistanceToVec(vec.add(0.D, -me.getEyeHeight(), 0.D)) < sqrtWHH0CubeD2 || 
+                !localSeen(me, vec, scaleSeenCheck))
+                continue;
+            
+            if (!vecs.add(vec)) break;
+        }
+    }
+}
+return vecs;
+}
+
+ 
+### Получение лучшей точки на хитбоксе:
+```java
+public static Vector3d getBestVector3dOnEntityBox(Entity entity, boolean alwaysMultipoints) {
+    if (entity == null) return mc.player.getEyePosition(1.F);
+    AxisAlignedBB aabb = entity.getRenderBoundingBox();
+    
+    double[] whh = new double[]{
+        entity.getWidth(), 
+        entity.getHeight(), 
+        entity.getHeight() / 1.05F
+    };
+    double[] xyz = new double[]{entity.getPosX(), entity.getPosY(), entity.getPosZ()};
+    
+    if (aabb != null) {
+        whh = new double[]{
+            aabb.maxX - aabb.minX, 
+            aabb.maxY - aabb.minY, 
+            (aabb.maxY - aabb.minY) / 1.1F
+        };
+        xyz = new double[]{aabb.minX + whh[0] / 2.D, aabb.minY, aabb.minZ + whh[0] / 2.D};
+    }
+    
+    double[] diffs = new double[]{
+        mc.player.getPosY() - xyz[1], 
+        getDistanceXZ(mc.player, xyz[0], xyz[2])
+    };
+    
+    // Адаптивная высота точки на основе дистанции
+    double ddtn = clamp(Easings.QUART_OUT.ease((diffs[1] - whh[0] / 2.F) / (5.D + whh[0] / 2.D)), 0.1D, .95D);
+    double pca = clamp(ddtn * ddtn, 0.D, 1.D);
+    final double pitchPointHeight = clamp(
+        (whh[2] / 2.D * pca + (whh[2] / 2.D) * (clamp(diffs[0] + pca, 0.D, 1.D))), 
+        0, whh[2]
+    );
+    
+    Vector3d defaultVec = new Vector3d(xyz[0], xyz[1] + pitchPointHeight, xyz[2]);
+    
+    // Если точка не видима, смещаем вниз
+    if (!alwaysMultipoints && !seenOnceVector3d(mc.player, defaultVec))
+        defaultVec = defaultVec.add(0.D, -pitchPointHeight / 2.D, 0.D);
+    
+    // Если мультипоинты не нужны или точка видима - возвращаем простую точку
+    if (whh[1] <= 1D || !alwaysMultipoints && seenOnceVector3d(mc.player, defaultVec)) {
+        return defaultVec;
+    } else {
+        // Генерация мультипоинтов и выбор ближайшей
+        final List<Vector3d> normalVecs = entityBoxVec3dsAlternate(entity, aabb);
+        
+        float factorDown = 1.F - (float) Math.max(Math.min((diffs[1] - 2.F) / 3.F, 1.F), 0.F);
+        final Vector3d toSortVec = new Vector3d(
+            mc.player.getPosX(), 
+            mc.player.getPosY() + .6F + lerp(pitchPointHeight, pitchPointHeight / 2.5F, factorDown), 
+            mc.player.getPosZ()
+        );
+        
+        if (normalVecs != null && normalVecs.size() > 1)
+            normalVecs.sort(Comparator.comparing(vec3 -> getDistanceAtVec3dToVec3d(toSortVec, vec3)));
+        
+        return normalVecs != null && normalVecs.size() > 0 ? normalVecs.get(0) : defaultVec;
+    }
+}
+6. RAYCAST СИСТЕМА - RayTraceUtil.java
+Импорты:
+java
+import lombok.experimental.UtilityClass;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.projectile.ProjectileHelper;
+import net.minecraft.util.math.*;
+import net.minecraft.util.math.vector.Vector3d;
+import net.minecraft.util.math.vector.Vector3f;
+import net.minecraft.world.World;
+ 
+import java.util.Optional;
+import java.util.function.Predicate;
+Конвертация yaw/pitch в вектор направления:
+java
+public Vector3f calculateViewVector(float yaw, float pitch) {
+    float pitchRad = (float) (pitch * (Math.PI / 180F));
+    float yawRad = (float) (-yaw * (Math.PI / 180F));
+    float cosYaw = MathHelper.cos(yawRad);
+    float sinYaw = MathHelper.sin(yawRad);
+    float cosPitch = MathHelper.cos(pitchRad);
+    float sinPitch = MathHelper.sin(pitchRad);
+ 
+    return new Vector3f(sinYaw * cosPitch, -sinPitch, cosYaw * cosPitch);
+}
+ 
+public Vector3d getVectorForRotation(float pitch, float yaw) {
+    float yawRadians = -yaw * ((float) Math.PI / 180) - (float) Math.PI;
+    float pitchRadians = -pitch * ((float) Math.PI / 180);
+ 
+    float cosYaw = MathHelper.cos(yawRadians);
+    float sinYaw = MathHelper.sin(yawRadians);
+    float cosPitch = -MathHelper.cos(pitchRadians);
+    float sinPitch = MathHelper.sin(pitchRadians);
+ 
+    return new Vector3d(sinYaw * cosPitch, sinPitch, cosYaw * cosPitch);
+}
+Проверка видимости цели:
+java
+public boolean isViewEntity(LivingEntity target, float yaw, float pitch, float distance, boolean ignoreWalls) {
+    Entity entity = mc.getRenderViewEntity();
+ 
+    if (entity == null || mc.world == null)
+        return false;
+ 
+    double reachDistanceSquared = distance * distance;
+ 
+    Vector3d startVec = entity.getEyePosition(1F);
+    Vector3f directionVec = calculateViewVector(yaw, pitch);
+    directionVec.mul(distance, distance, distance);
+    Vector3d endVec = startVec.add(directionVec.getX(), directionVec.getY(), directionVec.getZ());
+    AxisAlignedBB aabb = target.getBoundingBox();
+ 
+    EntityRayTraceResult result = ProjectileHelper.rayTraceEntities(
+            entity,
+            startVec,
+            endVec,
+            aabb,
+            (entityIn) -> !entityIn.isSpectator() && entityIn.isAlive() && entityIn == target,
+            reachDistanceSquared
+    );
+ 
+    return result != null;
+}
+Raycast к блокам:
+java
+public RayTraceResult traceBlock(Vector3d startVec, Vector3d endVec, RayTraceContext.BlockMode blockMode, RayTraceContext.FluidMode fluidMode) {
+    return mc.world.rayTraceBlocks(new RayTraceContext(
+            startVec,
+            endVec,
+            blockMode,
+            fluidMode,
+            mc.player)
+    );
+}
+7. GCD ПАТЧ - SensUtil.java
+Импорты:
+java
+import lombok.experimental.UtilityClass;
+import org.sheluvparis.excellent.api.interfaces.IMinecraft;
+Расчет GCD (Greatest Common Divisor):
+java
+public float getGCD() {
+    double mouseSensitivity = mc.gameSettings.mouseSensitivity;
+    // Формула Minecraft для расчета минимального шага мыши
+    return (float) (Math.pow(mouseSensitivity * 0.6F + 0.2F, 3.0D) * 8F);
+}
+ 
+public float getGCDValue() {
+    return (float) (getGCD() * 0.15D);
+}
+Применение GCD патча:
+java
+public float getSens(float rotation) {
+    // Округляет дельту вращения до ближайшего кратного GCD значения
+    return getDeltaMouse(rotation) * getGCDValue();
+}
+ 
+public float getDeltaMouse(float delta) {
+    return Math.round(delta / getGCDValue());
+}
+Логика: Minecraft проверяет что изменения rotationYaw/pitch кратны GCD значения. Патч округляет все изменения до кратных значений, что делает ротацию неотличимой от реальной мыши.
+
+8. ПРИМЕНЕНИЕ РОТАЦИИ - RotationComponent.java
+Импорты:
+java
+import lombok.Getter;
+import lombok.Setter;
+import lombok.experimental.Accessors;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.vector.Vector2f;
+import org.sheluvparis.common.events.orbit.EventHandler;
+import org.sheluvparis.excellent.client.events.player.JumpEvent;
+import org.sheluvparis.excellent.client.events.player.MoveInputEvent;
+import org.sheluvparis.excellent.client.events.player.StrafeEvent;
+import org.sheluvparis.excellent.client.events.player.UpdateEvent;
+import org.sheluvparis.excellent.client.impl.component.Component;
+import org.sheluvparis.excellent.client.impl.settings.impl.ModeSetting;
+import org.sheluvparis.excellent.client.util.combat.SensUtil;
+import org.sheluvparis.excellent.client.util.player.MoveUtil;
+ 
+import static net.minecraft.util.math.MathHelper.clamp;
+import static net.minecraft.util.math.MathHelper.wrapDegrees;
+Состояние системы:
+java
+public static RotationTask currentTask = RotationTask.IDLE;
+public static float currentTurnSpeed;
+public static float currentReturnSpeed;
+public static int currentPriority;
+public static int currentTimeout;
+ 
+public enum RotationTask {
+    AIM,    // Наведение на цель
+    RESET,  // Возврат к камере
+    IDLE    // Ожидание
+}
+Обновление ротации:
+java
+public static void update(Rotation rotation, float turnSpeed, float returnSpeed, int timeout, int priority) {
+    if (currentPriority > priority) {
+        return; // Приоритет уже занят другой задачей
+    }
+ 
+    if (currentTask == RotationTask.IDLE) {
+        FreeLookComponent.setActive(true); // Отделяет камеру от тела
+    }
+ 
+    currentTurnSpeed = turnSpeed;
+    currentReturnSpeed = returnSpeed;
+    currentTimeout = timeout;
+    currentPriority = priority;
+    currentTask = RotationTask.AIM;
+ 
+    updateRotation(rotation, turnSpeed);
+}
+Применение ротации к игроку:
+java
+private static boolean updateRotation(Rotation rotation, float turnSpeed) {
+    Rotation currentRotation = new Rotation(mc.player);
+ 
+    float yawDelta = wrapDegrees(rotation.getYaw() - currentRotation.getYaw());
+    float pitchDelta = rotation.getPitch() - currentRotation.getPitch();
+ 
+    float totalDelta = Math.abs(yawDelta) + Math.abs(pitchDelta);
+ 
+    // Распределение скорости между осями пропорционально дельте
+    float yawSpeed = (totalDelta == 0) ? 0 : Math.abs(yawDelta / totalDelta) * turnSpeed;
+    float pitchSpeed = (totalDelta == 0) ? 0 : Math.abs(pitchDelta / totalDelta) * turnSpeed;
+ 
+    // Применение с GCD патчем
+    mc.player.rotationYaw += SensUtil.getSens(clamp(yawDelta, -yawSpeed, yawSpeed));
+    mc.player.rotationPitch = MathHelper.clamp(
+        mc.player.rotationPitch + SensUtil.getSens(clamp(pitchDelta, -pitchSpeed, pitchSpeed)), 
+        -90F, 90F
+    );
+ 
+    Rotation finalRotation = new Rotation(mc.player);
+    idleTicks = 0;
+ 
+    // Возвращает true если достигли цели
+    return finalRotation.getDelta(rotation) < 
+           (currentTask.equals(RotationTask.RESET) ? currentReturnSpeed : currentTurnSpeed);
+}
+Автоматический возврат к камере:
+java
+@EventHandler
+public void tick(UpdateEvent event) {
+    idleTicks++;
+ 
+    if (currentTask == RotationTask.AIM && idleTicks > currentTimeout) {
+        currentTask = RotationTask.RESET; // Таймаут - возвращаемся к камере
+    }
+ 
+    if (currentTask == RotationTask.RESET) {
+        Rotation rotation = new Rotation(
+            mc.gameRenderer.getActiveRenderInfo().getYaw(), 
+            mc.gameRenderer.getActiveRenderInfo().getPitch()
+        );
+ 
+        if (updateRotation(rotation, currentReturnSpeed)) {
+            currentTask = RotationTask.IDLE;
+            currentPriority = 0;
+            FreeLookComponent.setActive(false);
+        }
+    }
+}
+9. СИСТЕМА РОТАЦИЙ - URotate.java
+Структура RotateRules:
+java
+@AllArgsConstructor
+private class RotateRules {
+    private final float скорость_возращения_ротации_в_исходное_положение;
+    private final boolean всегда_использовать_мультипоинты_без_необходимости;
+    private final Easing изинг_ротации;
+    private final float сила_изинга_от_0_до_1;
+    private final boolean развернуть_формулу_изинга;
+    private final boolean отводиться_перед_ударом, отводиться_перед_ударом_если_игрок_за_сетеной;
+    private final float опускать_питч_при_падении_на, дрожащий_рандоминг_Yaw, дрожащий_рандоминг_Pitch;
+    private final boolean не_позволять_Pitch_подниматься_при_падении;
+    private final float фактор_замедления_ротации_при_наводке_от_0_до_1;
+    private final boolean ротация_работает_только_перед_ударом, ротация_работает_только_во_время_удара;
+    private final float максимальная_скорость_Yaw, минимальная_скорость_Yaw, 
+                 максимальная_скорость_Pitch, минимальная_скорость_Pitch, 
+                 фактор_рандома_скорости_ротации_от_0_до_1, 
+                 фактор_взамоисключения_скорости_Yaw_и_Pitch;
+    private final boolean учитывать_чувствительность_мыши;
+    private final float размер_области_рандомизации_поинта_для_ротации;
+    private final boolean остановить_ротацию_перед_тиком_удара, 
+                 остановить_ротацию_в_тик_удара, 
+                 остановить_ротацию_после_тика_удара;
+    private final float максимальное_взаимное_волновое_смещение_оси_от_противоположной;
+    private final float градус_постоянной_отводки_нетнет_и_включить_пулялку_питча_в_небо;
+}
+Пример конфигурации режима "Матрикс":
+java
+case "Матрикс" -> {
+    rotationRules = new RotateRules(
+            180.F,              // Скорость возврата
+            true,               // Мультипоинты
+            null,               // Без изинга
+            0.F,                // Сила изинга
+            false,
+            true,               // Отводка перед ударом
+            false,
+            .0F,                // Опускание pitch при падении
+            3.F,                // Рандом Yaw
+            .8F,                // Рандом Pitch
+            false,
+            .0F,                // Фактор замедления
+            false,
+            false,
+            110.F,              // Макс. скорость Yaw
+            80.F,               // Мин. скорость Yaw
+            70.F,               // Макс. скорость Pitch
+            44.F,               // Мин. скорость Pitch
+            .05F,               // Фактор рандома скорости
+            .0F,                // Взаимоисключение скорости
+            true,               // GCD фильтр
+            .0F,                // Рандомизация поинта
+            false,
+            false,
+            false,
+            0.F,
+            0.F);
+}
+Главный метод расчета ротации:
+java
+public Vector3d2fRB updateRotationData(String rotationName, Vector2f prevRotation, double rangeRayCastCheck) {
+    RotateRules rotateRules = asRotationName(rotationName);
+    if (rotateRules == null)
+        return new Vector3d2fRB(aura.target().getEyePosition(mc.getRenderPartialTicks()), prevRotation, false);
+    
+    final Vector3d rotatePointVector3d = UBoxPoints.getBestVector3dOnEntityBox(aura.target(), rotateRules.isAlwaysUseMultiPoints());
+    final boolean notAnyTopPoint = UBoxPoints.entityBoxVec3dsAlternates(aura.target()).isEmpty();
+    
+    return updateRotationData(
+        rotationName, 
+        rotateRules, 
+        aura.target(), 
+        UAura.msCooldownReached(-100) && !UAura.msCooldownReached() && mc.player.getMotion().y <= .16470125793695456, // preHitTick
+        UAura.msCooldownReached() && !UAura.msCooldownReached(50), // hitTick
+        !UAura.msCooldownHasMs(50), // postHitTick
+        notAnyTopPoint, 
+        rotatePointVector3d, 
+        prevRotation, 
+        anyEntityOnRay(aura.target(), prevRotation.x, prevRotation.y, rangeRayCastCheck)
+    );
+}
+Логика расчета ротации:
+java
+private Vector3d2fRB updateRotationData(String rotationName, RotateRules rules, 
+    LivingEntity entityTarget, boolean preHitTick, boolean hitTick, boolean postHitTick, 
+    boolean behindWall, Vector3d rotateTo, Vector2f rotation, boolean prevRayCasted) {
+    
+    if (rules == null || entityTarget == null || entityTarget.getBoundingBox() == null)
+        return new Vector3d2fRB(rotateTo, rotation, false);
+    
+    this.returnSpeed = rules.getReturnRotationSpeed();
+    
+    // Проверка условий работы ротации
+    if (rules.isRotOnlyPreHitTick() && !(preHitTick || UAura.msCooldownReached()) || 
+        rules.isRotOnlyHitTick() && !(hitTick || UAura.msCooldownReached(50))) {
+        return new Vector3d2fRB(rotateTo, rotation, false);
+    }
+ 
+    // Копирование ротации для изоляции
+    rotation = new Vector2f(rotation.x, rotation.y);
+    
+    // Получение параметров из правил
+    Easing easing = rules.getEaseRotate();
+    float easingPC = rules.getEaseStrengthPercent();
+    boolean easingIsOpposite = rules.isEasingOpposite();
+    double posRandomValue = rules.getVectorPointPosRandom0rec();
+    
+    boolean forceTurnAway = (rules.isPreHitTurnAway() && preHitTick) ||
+                           (rules.isBehindWallTurnAway() && behindWall && preHitTick);
+    
+    boolean forceStopRotation = rules.isPauseRotationPreHitTick() && preHitTick || 
+                              rules.isPauseRotationOnHitTick() && hitTick || 
+                              rules.isPauseRotationPostHitTick() && postHitTick;
+    
+    // Рандомизация точки
+    if (posRandomValue > 0.F)
+        rotateTo = rotateTo.add(randomAroundD2(posRandomValue), randomAroundD2(posRandomValue), randomAroundD2(posRandomValue));
+ 
+    // Расчет базовых углов
+    Vector2f virtRotateVanilla = getVanillaRotate(rotateTo);
+    
+    // Отводка перед ударом
+    if (forceTurnAway) 
+        virtRotateVanilla = getTurnAwayOfRotate(virtRotateVanilla, entityTarget, 6.F, 5);
+    
+    // Добавление рандомизации
+    float addRandomYaw = rules.getRandRotDragYaw045() == 0.F ? 0.F : randomAroundF2(rules.getRandRotDragYaw045());
+    float addRandomPitch = rules.getRandRotDragPitch030() == 0.F ? 0.F : randomAroundF2(rules.getRandRotDragPitch030());
+    
+    if (addRandomYaw != 0.F || addRandomPitch != 0.F) {
+        virtRotateVanilla.x += addRandomYaw;
+        virtRotateVanilla.y += addRandomPitch;
+    }
+    
+    // Расчет скорости
+    float yawDiffAtPrev = RotationUtil.getAngleDifference(rotation.x, virtRotateVanilla.x);
+    float pitchDiffAtPrev = Math.abs(rotation.y - virtRotateVanilla.y);
+    
+    float yawDiffPC01 = Math.min(yawDiffAtPrev / 180.F, 1.F);
+    float pitchDiffPC01 = Math.min(pitchDiffAtPrev / 90.F, 1.F);
+    
+    // Применение изинга
+    float yawSpeedPC01Calc = yawDiffPC01;
+    float pitchSpeedPC01Calc = pitchDiffPC01;
+    
+    if (easing != null && easingPC > 0.F) {
+        if (easingIsOpposite) {
+            yawSpeedPC01Calc = lerp(1.F - yawDiffPC01, (float) easing.ease(1.F - yawDiffPC01), easingPC);
+            pitchSpeedPC01Calc = lerp(1.F - pitchDiffPC01, (float) easing.ease(1.F - pitchDiffPC01), easingPC);
+        } else {
+            yawSpeedPC01Calc = lerp(yawDiffPC01, (float) easing.ease(yawDiffPC01), easingPC);
+            pitchSpeedPC01Calc = lerp(pitchDiffPC01, (float) easing.ease(pitchDiffPC01), easingPC);
+        }
+    }
+    
+    // Взаимоисключение скорости осей
+    float mixYawSpeedAndPitchSpeedPC01 = Math.min(rules.getMutualExclusionXYSpeedMul01(), 1.F);
+    if (mixYawSpeedAndPitchSpeedPC01 > 0.F) {
+        float yawSpeedPC01CalcCopy = yawSpeedPC01Calc;
+        yawSpeedPC01Calc *= 1.F - pitchSpeedPC01Calc * mixYawSpeedAndPitchSpeedPC01;
+        pitchSpeedPC01Calc *= 1.F - yawSpeedPC01CalcCopy * mixYawSpeedAndPitchSpeedPC01;
+    }
+    
+    // Финальная скорость
+    float minYawSpeed = rules.getMinYawSpeed0180();
+    float maxYawSpeed = rules.getMaxYawSpeed0180();
+    float minPitchSpeed = rules.getMinPitchSpeed090();
+    float maxPitchSpeed = rules.getMaxPitchSpeed090();
+    
+    float yawSpeed = lerp(minYawSpeed, maxYawSpeed, yawSpeedPC01Calc) * speedMul;
+    float pitchSpeed = lerp(minPitchSpeed, maxPitchSpeed, pitchSpeedPC01Calc) * speedMul;
+    
+    // Применение скорости
+    final float yawDelta = wrapDegrees(virtRotateVanilla.x - rotation.x);
+    final float pitchDelta = virtRotateVanilla.y - mc.player.rotationPitch;
+    
+    if (!forceStopRotation) {
+        rotation.x = wrapDegrees(rotation.x + clamp(yawDelta, -yawSpeed, yawSpeed));
+        rotation.y = mc.player.rotationPitch + clamp(pitchDelta, -pitchSpeed, pitchSpeed);
+    }
+    
+    // GCD патч
+    if (gcdFix) {
+        rotation.x = SensUtil.getSens(rotation.x);
+        rotation.y = SensUtil.getSens(rotation.y);
+    }
+    
+    return new Vector3d2fRB(rotateTo, rotation, true);
+}
+10. ПОРТ НА 1.21.1 - КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ
+Что нужно изменить для 1.21.1:
+Пакеты: Заменить старые пакеты на новые версии 1.21.1
+CPlayerDiggingPacket → PlayerInteractBlockC2SPacket / PlayerActionC2SPacket
+CHeldItemChangePacket → UpdateSelectedSlotC2SPacket
+CEntityActionPacket → PlayerCommandC2SPacket
+CPlayerTryUseItemPacket → PlayerInteractItemC2SPacket
+Entity методы:
+getEyePosition() → getEyePosition(float partialTick)
+getPositionVec() → getPos()
+getRenderBoundingBox() → getBoundingBox()
+getHeldItemMainhand() → getMainHandItem()
+getHeldItemOffhand() → getOffhandItem()
+Math векторы:
+Vector3d → Vec3
+Vector2f → Vec2
+Vector3f → Vec3f
+World методы:
+loadedEntityList() → entities()
+loadedLivingEntityList() → getEntities()
+rayTraceBlocks() → clip()
+rayTraceEntities() → getEntityCollisions()
+Player методы:
+rotationYaw → getYRot()
+rotationPitch → getXRot()
+getDistance() → distanceTo()
+validDistance() → реализовать через distanceTo()
+Item типы:
+AxeItem → TieredItem с проверкой getTier()
+Items.SHIELD → Items.SHIELD (без изменений)
+Атрибуты:
+Attributes.ATTACK_SPEED → BaseAttributes.ATTACK_SPEED
+Event система:
+Обновить event handlers на новые версии API
+Пример адаптации для 1.21.1:
+java
+// Старый код (1.8.9)
+new CHeldItemChangePacket(slot).sendSilent();
+ 
+// Новый код (1.21.1)
+mc.player.connection.send(new UpdateSelectedSlotC2SPacket(slot));
+ 
+// Старый код
+mc.playerController.attackEntity(mc.player, livingIn);
+ 
+// Новый код
+mc.player.attack(livingIn);
+ 
+// Старый код
+Vector3d vec = entity.getEyePosition(1.F);
+ 
+// Новый код
+Vec3 vec = entity.getEyePosition(1.0F);
+ 
+// Старый код
+float yaw = mc.player.rotationYaw;
+ 
+// Новый код
+float yaw = mc.player.getYRot();
+11. КЛЮЧЕВЫЕ АЛГОРИТМЫ ДЛЯ РЕАЛИЗАЦИИ
+Алгоритм главного цикла:
+Получить список энтити в мире
+Отфильтровать по типу, дистанции, видимости
+Отсортировать по приоритету (броня/FOV/дистанция/здоровье)
+Выбрать лучшую цель
+Рассчитать оптимальную точку на хитбоксе (мультипоинты)
+Конвертировать 3D точку в yaw/pitch
+Применить изинг и ограничить скорость
+Добавить рандомизацию
+Применить GCD патч
+Отправить ротацию в RotationComponent
+Проверить условия атаки (дистанция, кулдаун, момент крита, raycast)
+Выполнить bypass задачи (shield break, sprint reset)
+Атаковать цель
+Сбросить кулдаун
+Алгоритм мультипоинтов:
+Получить AABB хитбокса цели
+Рассчитать адаптивное количество точек (5-14 по XZ, 9-27 по Y)
+Генерировать сетку точек по всему хитбоксу
+Отфильтровать внутренние точки
+Проверить видимость каждой точки raycast
+Отсортировать по дистанции от игрока
+Вернуть ближайшую видимую точку
+Алгоритм GCD патча:
+Получить sensitivity из настроек
+Рассчитать GCD: (sens * 0.6 + 0.2)^3 * 8
+Для каждого изменения rotation:
+Разделить дельту на GCD
+Округлить до целого
+Умножить обратно на GCD
+Применить к rotationYaw/pitch
+Эта документация содержит полную логику системы KillAura для портирования на версию 1.21.1 с сохранением всех bypass техник и алгоритмов.

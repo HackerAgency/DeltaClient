@@ -1,0 +1,1 @@
+$env:JAVA_HOME="C:\Program Files\Eclipse Adoptium\jdk-21.0.10.7-hotspot"; $env:PATH="C:\Program Files\Eclipse Adoptium\jdk-21.0.10.7-hotspot\bin;$env:PATH"; .\gradlew runClient
