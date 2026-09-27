@@ -296,7 +296,7 @@ public class RotationProcessor extends BaseProcessor {
         bezierTick++;
         float t = MathHelper.clamp((float) bezierTick / (float) bezierTotalTicks, 0.0f, 1.0f);
         // easeInOutCubic — быстрый старт, плавная (но НЕ бесконечная) доводка в конце
-        float e = t < 0.5f ? 4.0f * t * t * t : 1.0f - Math.pow(-2.0f * t + 2.0f, 3.0f) / 2.0f;
+        float e = t < 0.5f ? 4.0f * t * t * t : (float) (1.0 - Math.pow(-2.0 * t + 2.0, 3.0) / 2.0);
         Rotation point = cubicBezier(bezierStart, bezierControl1, bezierControl2, bezierEnd, e);
         applyRotationStep(point, speed, false);
         if (bezierTick >= bezierTotalTicks) {
