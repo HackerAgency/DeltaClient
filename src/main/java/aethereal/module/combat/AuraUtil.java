@@ -28,51 +28,65 @@ public class AuraUtil implements Interface {
 
     private static final SecureRandom random = new SecureRandom();
 
+    /**
+     * Сетка точек ВНУТРИ хитбокса (без выхода за его пределы).
+     * Шаг по X/Z = 1/4 ширины, шаг по Y = высоты/6 — точки распределены по всей площади
+     * хитбокса, поэтому наведение "гуляет" по всему боксу, оставаясь в зоне попадания.
+     */
     public static List<Vec3d> generateMultiPoints(LivingEntity entity, float maxReach, boolean ignoreWalls) {
         Box box = entity.getBoundingBox();
         Vec3d eye = mc.player.getEyePos();
         List<Vec3d> points = new ArrayList<>();
-        
-        // Генерируем точки по высоте хитбокса
-        double stepY = box.getLengthY() / 8.0;
-        for (double y = box.minY; y <= box.maxY; y += stepY) {
-            // Центральная точка
-            Vec3d center = new Vec3d(box.getCenter().x, y, box.getCenter().z);
-            if (isReachable(eye, center, maxReach, ignoreWalls)) {
-                points.add(center);
-            }
-            
-            // Точки с выходом за пределы хитбокса
-            double offsetX = random.nextGaussian() * 0.15;
-            double offsetZ = random.nextGaussian() * 0.15;
-            Vec3d offsetPoint = new Vec3d(box.getCenter().x + offsetX, y, box.getCenter().z + offsetZ);
-            if (isReachable(eye, offsetPoint, maxReach, ignoreWalls)) {
-                points.add(offsetPoint);
-            }
-        }
-        
-        // Добавляем угловые точки с выходом за пределы
-        for (double y = box.minY; y <= box.maxY; y += stepY * 2) {
-            for (double x = box.minX - 0.1; x <= box.maxX + 0.1; x += box.getLengthX() / 3.0) {
-                for (double z = box.minZ - 0.1; z <= box.maxZ + 0.1; z += box.getLengthZ() / 3.0) {
-                    Vec3d corner = new Vec3d(x, y, z);
-                    if (isReachable(eye, corner, maxReach, ignoreWalls)) {
-                        points.add(corner);
+
+        double inset = 0.03;
+        double stepX = Math.max((box.getLengthX() - inset * 2.0) / 4.0, 0.05);
+        double stepZ = Math.max((box.getLengthZ() - inset * 2.0) / 4.0, 0.05);
+        double stepY = Math.max((box.getLengthY() - inset * 2.0) / 6.0, 0.1);
+
+        for (double y = box.minY + inset; y <= box.maxY - inset; y += stepY) {
+            for (double x = box.minX + inset; x <= box.maxX - inset + 1.0E-4; x += stepX) {
+                for (double z = box.minZ + inset; z <= box.maxZ - inset + 1.0E-4; z += stepZ) {
+                    Vec3d point = new Vec3d(x, y, z);
+                    if (isReachable(eye, point, maxReach, ignoreWalls)) {
+                        points.add(point);
                     }
                 }
             }
         }
-        
+
+        if (points.isEmpty()) {
+            Vec3d center = new Vec3d(box.getCenter().x,
+                    MathHelper.clamp(eye.y, box.minY + inset, box.maxY - inset), box.getCenter().z);
+            if (isReachable(eye, center, maxReach, ignoreWalls)) {
+                points.add(center);
+            }
+        }
         return points;
     }
 
+    /**
+     * Выбор точки: сначала берется случайная зона (кластер соседних точек) — это дает
+     * разнообразие наведений между тиками, затем внутри зоны выбирается точка с
+     * минимальной стоимостью доводки. Исключает блуждание по мелким точкам и дерганье.
+     */
     public static Vec3d findBestPoint(List<Vec3d> points, Vec3d eye) {
         if (points.isEmpty()) {
             return null;
         }
-        return points.stream().min(Comparator.comparing(point -> {
-            return computeRotationCost(eye, point);
-        })).orElse(null);
+        if (points.size() == 1) {
+            return points.get(0);
+        }
+        Vec3d pivot = points.get(random.nextInt(points.size()));
+        final double zoneRadiusSq = 0.28 * 0.28;
+        List<Vec3d> zone = new ArrayList<>();
+        for (Vec3d p : points) {
+            if (p.squaredDistanceTo(pivot) <= zoneRadiusSq) {
+                zone.add(p);
+            }
+        }
+        List<Vec3d> candidates = zone.isEmpty() ? points : zone;
+        return candidates.stream().min(Comparator.comparingDouble(point ->
+                computeRotationCost(eye, point))).orElse(null);
     }
 
     private static double computeRotationCost(Vec3d eye, Vec3d point) {
@@ -84,6 +98,24 @@ public class AuraUtil implements Interface {
         double yawDiff = MathHelper.wrapDegrees((float) (yaw - currentYaw));
         double pitchDiff = MathHelper.wrapDegrees((float) (pitch - currentPitch));
         return Math.hypot(yawDiff, pitchDiff);
+    }
+
+    /* ===== Кэш точек наведения: не даем цели "плавать" каждые несколько тиков ===== */
+    private static LivingEntity cachedPointsOwner;
+    private static long cachedPointsTime;
+    private static final List<Vec3d> cachedPoints = new ArrayList<>();
+
+    public static Vec3d chooseAimPoint(LivingEntity entity, float maxReach, boolean ignoreWalls) {
+        Vec3d eye = mc.player != null ? mc.player.getEyePos() : entity.getPos();
+        long now = System.currentTimeMillis();
+        boolean fresh = cachedPointsOwner == entity && (now - cachedPointsTime) < 180L && !cachedPoints.isEmpty();
+        if (!fresh) {
+            cachedPoints.clear();
+            cachedPoints.addAll(generateMultiPoints(entity, maxReach, ignoreWalls));
+            cachedPointsOwner = entity;
+            cachedPointsTime = now;
+        }
+        return findBestPoint(cachedPoints, eye);
     }
 
     private static boolean isReachable(Vec3d eye, Vec3d point, float maxReach, boolean ignoreWalls) {

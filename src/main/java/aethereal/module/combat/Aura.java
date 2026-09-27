@@ -84,12 +84,6 @@ public class Aura extends Module {
     private final int[] funtimeAttackDelays = {10, 10, 10, 10, 12};
     private final int[] legitAttackDelays = {10, 10, 10, 13};
     private final SecureRandom secureRandom = new SecureRandom();
-    private Rotation bezierStartRotation;
-    private Rotation bezierTargetRotation;
-    private float bezierControlOffsetX;
-    private float bezierControlOffsetY;
-    private float bezierProgress;
-    private long bezierLastTimeNanos;
     boolean willLand;
     boolean randomDirection = false;
     private LivingEntity target;
@@ -201,8 +195,6 @@ public class Aura extends Module {
         this.cachedHitbox = null;
         this.cachedPoint = null;
         this.cachedRotation = null;
-        this.bezierProgress = 1.0f;
-        this.bezierLastTimeNanos = System.nanoTime();
         this.neuroLearn.onDeactivate(this);
         this.neuroExec.onDeactivate();
     }
@@ -272,7 +264,9 @@ public class Aura extends Module {
             double reach = this.attackDistance.c().floatValue();
             boolean throughWalls = this.rotationType.c().contains("ФанТайм")
                     || !this.dontHitWhen.a("Враг за стеной").c().booleanValue();
-            Vec3d targetPosition = AuraUtil.a(eye, this.target, reach, throughWalls);
+            Vec3d aimPoint = AuraUtil.chooseAimPoint(this.target, (float) reach, throughWalls);
+            Vec3d targetPosition = aimPoint != null ? aimPoint.subtract(eye)
+                    : AuraUtil.a(eye, this.target, reach, throughWalls);
             float yawToTarget = targetPosition == Vec3d.ZERO ? Look.b()
                     : (float) MathHelper.wrapDegrees(Math.toDegrees(Math.atan2(targetPosition.z, targetPosition.x)) - 90.0d);
             float pitchToTarget = targetPosition == Vec3d.ZERO ? Look.c()
@@ -327,14 +321,13 @@ public class Aura extends Module {
             Vec3d eye = mc.player.getEyePos();
             Vec3d targetPosition = this.target.getEyePos();
             
-            // Используем мультипоинты для плавного движения внутри хитбокса
+            // Точка наведения — внутри хитбокса, с кэшем для стабильности между тиками
             boolean ignoreWalls = this.dontHitWhen.a("Враг за стеной") != null 
                     && this.dontHitWhen.a("Враг за стеной").c().booleanValue();
-            List<Vec3d> multiPoints = AuraUtil.generateMultiPoints(this.target, 
+            Vec3d bestPoint = AuraUtil.chooseAimPoint(this.target,
                     this.attackDistance.c().floatValue(), ignoreWalls);
-            Vec3d bestPoint = AuraUtil.findBestPoint(multiPoints, eye);
             if (bestPoint != null) {
-                targetPosition = bestPoint;
+                targetPosition = bestPoint.subtract(eye);
             }
             
             if (this.rotationType.c().equals("ФанТайм ФОВ")) {
@@ -668,37 +661,6 @@ public class Aura extends Module {
         return MathHelper.lerp(secureRandom.nextFloat(), min, max);
     }
 
-    private Rotation cubicBezier(Rotation start, Rotation target, float progress, float offsetX1, float offsetY1, float offsetX2, float offsetY2) {
-        float t = MathHelper.clamp(progress, 0.0f, 1.0f);
-        float oneMinusT = 1.0f - t;
-        float t2 = t * t;
-        float oneMinusT2 = oneMinusT * oneMinusT;
-        
-        float yawDiff = MathHelper.wrapDegrees(target.c() - start.c());
-        float pitchDiff = target.d() - start.d(); // Pitch не заворачивается через 180 градусов
-        
-        // Две контрольные точки для кубической кривой Безье
-        float control1Yaw = start.c() + (yawDiff * 0.25f) + offsetX1;
-        float control1Pitch = start.d() + (pitchDiff * 0.25f) + offsetY1;
-        float control2Yaw = start.c() + (yawDiff * 0.75f) + offsetX2;
-        float control2Pitch = start.d() + (pitchDiff * 0.75f) + offsetY2;
-        
-        // Кубическая кривая Безье: B(t) = (1-t)^3*P0 + 3(1-t)^2*t*P1 + 3(1-t)*t^2*P2 + t^3*P3
-        float bezierYaw = (oneMinusT2 * oneMinusT * start.c()) 
-                + (3.0f * oneMinusT2 * t * control1Yaw) 
-                + (3.0f * oneMinusT * t2 * control2Yaw) 
-                + (t2 * t * target.c());
-        float bezierPitch = (oneMinusT2 * oneMinusT * start.d()) 
-                + (3.0f * oneMinusT2 * t * control1Pitch) 
-                + (3.0f * oneMinusT * t2 * control2Pitch) 
-                + (t2 * t * target.d());
-        
-        // Клипим pitch в допустимые пределы (-90 до 90)
-        bezierPitch = MathHelper.clamp(bezierPitch, -90.0f, 90.0f);
-        
-        return new Rotation(bezierYaw, bezierPitch);
-    }
-
     private void rotateToTarget() {
         if (neuroLearn()) {
             return;
@@ -714,18 +676,11 @@ public class Aura extends Module {
         boolean throughWalls = this.rotationType.c().contains("ФанТайм")
                 || !this.dontHitWhen.a("Враг за стеной").c().booleanValue();
         
-        // Используем мультипоинты для плавного движения внутри хитбокса с выходом за пределы
-        // Проверяем дистанцию атаки чтобы не опускать голову когда цель далеко
-        Vec3d targetPosition;
-        double distanceToTarget = mc.player.getEyePos().distanceTo(target.getEyePos());
-        if (distanceToTarget <= reach * 1.5) {
-            List<Vec3d> multiPoints = AuraUtil.generateMultiPoints(target, (float) reach, throughWalls);
-            Vec3d bestPoint = AuraUtil.findBestPoint(multiPoints, eye);
-            targetPosition = bestPoint != null ? bestPoint : AuraUtil.a(eye, target, reach, throughWalls);
-        } else {
-            // Если цель далеко - используем обычную точку
-            targetPosition = AuraUtil.a(eye, target, reach, throughWalls);
-        }
+        // Точка наведения выбирается ВНУТРИ хитбокса (без выхода за его пределы) и
+        // кэшируется на короткое время, чтобы прицел не "плавал" между тиками.
+        Vec3d aimPoint = AuraUtil.chooseAimPoint(target, (float) reach, throughWalls);
+        Vec3d targetPosition = aimPoint != null ? aimPoint.subtract(eye)
+                : AuraUtil.a(eye, target, reach, throughWalls);
         
         // Вычисляем вектор от глаз к цели
         Vec3d diff = targetPosition.subtract(eye);
@@ -821,8 +776,9 @@ public class Aura extends Module {
         float yawDiff = MathHelper.wrapDegrees(yawToTarget - currentYaw);
         float pitchDiff = pitchToTarget - currentPitch;
         
-        // SmoothFactor - коэффициент сглаживания (0.4-0.7 = 40-70% от разницы углов)
-        float smoothFactor = 0.4f + (secureRandom.nextFloat() * 0.3f);
+        // SmoothFactor - коэффициент сглаживания с рандомизацией скорости в пределах 0.3
+        // (фактор 0.6 +/- 0.3 => 0.3..0.9 от разницы углов за тик)
+        float smoothFactor = MathHelper.clamp(0.6f + (secureRandom.nextFloat() * 0.6f - 0.3f), 0.3f, 0.9f);
         float finalYaw = currentYaw + yawDiff * smoothFactor;
         float finalPitch = currentPitch + pitchDiff * smoothFactor;
         
@@ -833,21 +789,18 @@ public class Aura extends Module {
         finalYaw += wave1 * 1.0f + (secureRandom.nextFloat() - 0.5f) * 1.5f;
         finalPitch += wave2 * 0.8f + (secureRandom.nextFloat() - 0.5f) * 1.0f;
         
-        // Если готов к атаке - наводим точно на хитбокс
-        if (canAttack() && this.target != null) {
-            Vec3d eye = mc.player.getEyePos();
-            Vec3d targetPos = this.target.getEyePos();
-            Vec3d diff = targetPos.subtract(eye);
-            finalYaw = currentYaw + MathHelper.wrapDegrees(
-                (float) Math.toDegrees(Math.atan2(diff.z, diff.x)) - 90.0f - currentYaw) * 0.8f;
-            finalPitch = currentPitch + (float) (-Math.toDegrees(Math.atan2(diff.y, Math.hypot(diff.x, diff.z))) - currentPitch) * 0.8f;
+        // Если готовы к атаке — доводим точно в выбранную точку хитбокса (без перескока
+        // на глаза цели: раньше прицел "гулял" между двумя целями и не доводился до конца)
+        if (canAttack()) {
+            finalYaw = yawToTarget;
+            finalPitch = pitchToTarget;
         }
         
         // Клипим pitch
         finalPitch = MathHelper.clamp(finalPitch, -90.0f, 90.0f);
         
         // Скорость 60 yaw, 23 pitch
-        Delta.getInstance().getModuleProcessor().k().startAiming(new Rotation(finalYaw, finalPitch), 180.0f, 60, 23);
+        Delta.getInstance().getModuleProcessor().k().startAiming(new Rotation(finalYaw, finalPitch), 180.0f, 1, 2);
     }
 
     private void applyLegitSmoothing(float yawToTarget, float pitchToTarget, Vec3d vec3d) {
@@ -857,8 +810,9 @@ public class Aura extends Module {
         float yawDiff = MathHelper.wrapDegrees(yawToTarget - currentYaw);
         float pitchDiff = pitchToTarget - currentPitch;
         
-        // Более быстрая интерполяция
-        float smoothFactor = 0.5f + (ThreadLocalRandom.current().nextFloat(0.0f, 1.0f) * 0.3f);
+        // Более быстрая интерполяция с рандомизацией скорости в пределах 0.3
+        // (фактор 0.65 +/- 0.3 => 0.35..0.95 от разницы углов за тик)
+        float smoothFactor = MathHelper.clamp(0.65f + (ThreadLocalRandom.current().nextFloat(0.0f, 1.0f) * 0.6f - 0.3f), 0.35f, 0.95f);
         float finalYaw = currentYaw + yawDiff * smoothFactor;
         float finalPitch = currentPitch + pitchDiff * smoothFactor;
         
@@ -872,6 +826,6 @@ public class Aura extends Module {
         finalPitch = MathHelper.clamp(finalPitch, -90.0f, 90.0f);
         
         // Скорость 60 yaw, 23 pitch
-        Delta.getInstance().getModuleProcessor().k().startAiming(new Rotation(finalYaw, finalPitch), 180.0f, 60, 23);
+        Delta.getInstance().getModuleProcessor().k().startAiming(new Rotation(finalYaw, finalPitch), 180.0f, 1, 2);
     }
 }

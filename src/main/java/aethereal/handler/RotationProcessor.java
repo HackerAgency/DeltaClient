@@ -15,6 +15,7 @@ import net.minecraft.item.Items;
 import net.minecraft.util.math.MathHelper;
 
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 
 public class RotationProcessor extends BaseProcessor {
     private static rotationState state;
@@ -24,6 +25,15 @@ public class RotationProcessor extends BaseProcessor {
     private static int currentTick;
     private static int minResetTicks;
     private static int priority;
+
+    /* ===== Кубическая кривая Безье для наведения ===== */
+    private static Rotation bezierStart;
+    private static Rotation bezierEnd;
+    private static Rotation bezierControl1;
+    private static Rotation bezierControl2;
+    private static int bezierTotalTicks;
+    private static int bezierTick;
+    private static float bezierAimSpeed;
 
     static {
         state = rotationState.IDLE;
@@ -48,6 +58,8 @@ public class RotationProcessor extends BaseProcessor {
         state = rotationState.IDLE;
         currentTick = 0;
         priority = 0;
+        bezierStart = null;
+        bezierEnd = null;
     }
 
     private static boolean isUsingUseableItem() {
@@ -150,6 +162,11 @@ public class RotationProcessor extends BaseProcessor {
     @EventTarget
     private void onGlobalEvent(GlobalEvent e2) {
         currentTick++;
+        // Продолжение движения по кубической кривой Безье между вызовами наведения
+        if (state == rotationState.AIM && bezierStart != null && bezierEnd != null
+                && currentTick <= maxTicks) {
+            stepBezier(bezierAimSpeed);
+        }
         if (isRotating()) {
             if (isUsingUseableItem()) {
                 applyRotationStep(getDefaultWobbleRotation(), resetSpeed, false);
@@ -172,6 +189,29 @@ public class RotationProcessor extends BaseProcessor {
     }
 
     public void startAiming(Rotation rotation, float turnSpeed, int lookMode, int priority) {
+        // Основной путь наведения: кубическая кривая Безье с рандомизацией скорости (+-30%).
+        // Кривая гарантированно доводится до цели за конечное число тиков (без "вечного хвоста").
+        if (mc.player != null && rotation != null && lookMode != 0 && priority >= RotationProcessor.priority) {
+            Rotation current = new Rotation(mc.player);
+            double delta = current.a(rotation);
+            // Если цель уже "на кончике прицела" — кривая не нужна, точная доводка
+            if (delta > 1.2d) {
+                ThreadLocalRandom rnd = ThreadLocalRandom.current();
+                float speed = (float) (turnSpeed * (0.7d + rnd.nextDouble() * 0.6d));
+                if (state == rotationState.IDLE) {
+                    this.currentLook.a(true);
+                }
+                RotationProcessor.lookMode = lookMode;
+                maxTicks = getMaxTicksForMode(lookMode);
+                RotationProcessor.resetSpeed = turnSpeed;
+                RotationProcessor.priority = priority;
+                state = rotationState.AIM;
+                currentTick = 0;
+                int ticks = (int) MathHelper.clamp(Math.ceil(delta / speed), 2.0d, 8.0d);
+                beginBezier(current, rotation, ticks, speed);
+                return;
+            }
+        }
         startAimingWithSpeeds(rotation, turnSpeed, turnSpeed, lookMode, priority);
     }
 
@@ -191,7 +231,93 @@ public class RotationProcessor extends BaseProcessor {
         RotationProcessor.priority = priority;
         state = rotationState.AIM;
         currentTick = 0;
+        bezierStart = null;
         applyRotationStep(rotation, aimSpeed, true);
+    }
+
+    /* ===================== Кубическая кривая Безье ===================== */
+
+    /**
+     * Наведение по кубической кривой Безье. В отличие от экспоненциального lerp
+     * (который в конце движется бесконечно медленно и никогда не доводится),
+     * кривая гарантированно проходит через конечную точку за фиксированное число тиков.
+     * Скорость движения рандомизирована в пределах +/- 30%.
+     */
+    public void startBezierAiming(Rotation target, float baseSpeed, int priority) {
+        if (mc.player == null || target == null || priority < RotationProcessor.priority) {
+            return;
+        }
+        if (state == rotationState.IDLE) {
+            this.currentLook.a(true);
+        }
+        RotationProcessor.priority = priority;
+        state = rotationState.AIM;
+        currentTick = 0;
+        Rotation current = new Rotation(mc.player);
+        double delta = current.a(target);
+        if (delta < 0.6d) {
+            // Уже наведены — просто точно доводим без дребезга
+            bezierStart = null;
+            applyRotationStep(target, baseSpeed, true);
+            return;
+        }
+        // Рандомизация скорости +-30%
+        float speed = (float) (baseSpeed * (0.7d + ThreadLocalRandom.current().nextDouble() * 0.6d));
+        bezierAimSpeed = speed;
+        int ticks = (int) MathHelper.clamp(Math.ceil(delta / speed), 2.0d, 8.0d);
+        beginBezier(current, target, ticks, speed);
+    }
+
+    private void beginBezier(Rotation start, Rotation end, int ticks, float speed) {
+        bezierStart = start;
+        bezierEnd = end;
+        bezierTotalTicks = ticks;
+        bezierTick = 0;
+        double yawDiff = MathHelper.wrapDegrees(end.c() - start.c());
+        double pitchDiff = end.d() - start.d();
+        ThreadLocalRandom rnd = ThreadLocalRandom.current();
+        // Контрольные точки дают естественную дугообразную траекторию (как у мыши человека)
+        double offY1 = yawDiff * rnd.nextDouble(0.02d, 0.10d) * (rnd.nextBoolean() ? 1 : -1);
+        double offP1 = pitchDiff * rnd.nextDouble(0.02d, 0.10d) * (rnd.nextBoolean() ? 1 : -1);
+        double offY2 = yawDiff * rnd.nextDouble(0.01d, 0.06d) * (rnd.nextBoolean() ? 1 : -1);
+        double offP2 = pitchDiff * rnd.nextDouble(0.01d, 0.06d) * (rnd.nextBoolean() ? 1 : -1);
+        bezierControl1 = new Rotation((float) (start.c() + yawDiff * 0.35d + offY1),
+                (float) MathHelper.clamp(start.d() + pitchDiff * 0.35d + offP1, -90.0d, 90.0d));
+        bezierControl2 = new Rotation((float) (start.c() + yawDiff * 0.72d + offY2),
+                (float) MathHelper.clamp(start.d() + pitchDiff * 0.72d + offP2, -90.0d, 90.0d));
+        // Первый шаг сразу задаем скорость, чтобы движение начиналось быстро
+        stepBezier(speed);
+    }
+
+    private void stepBezier(float speed) {
+        if (bezierStart == null || bezierEnd == null) {
+            return;
+        }
+        bezierTick++;
+        float t = MathHelper.clamp((float) bezierTick / (float) bezierTotalTicks, 0.0f, 1.0f);
+        // easeInOutCubic — быстрый старт, плавная (но НЕ бесконечная) доводка в конце
+        float e = t < 0.5f ? 4.0f * t * t * t : 1.0f - Math.pow(-2.0f * t + 2.0f, 3.0f) / 2.0f;
+        Rotation point = cubicBezier(bezierStart, bezierControl1, bezierControl2, bezierEnd, e);
+        applyRotationStep(point, speed, false);
+        if (bezierTick >= bezierTotalTicks) {
+            // Гарантированная финальная доводка точно в цель
+            applyRotationStep(bezierEnd, speed, true);
+            bezierStart = null;
+            bezierEnd = null;
+        }
+    }
+
+    private static Rotation cubicBezier(Rotation p0, Rotation p1, Rotation p2, Rotation p3, float t) {
+        float u = 1.0f - t;
+        float uu = u * u;
+        float tt = t * t;
+        float w0 = uu * u;
+        float w1 = 3.0f * uu * t;
+        float w2 = 3.0f * u * tt;
+        float w3 = tt * t;
+        float yaw = w0 * p0.c() + w1 * p1.c() + w2 * p2.c() + w3 * p3.c();
+        float pitch = w0 * p0.d() + w1 * p1.d() + w2 * p2.d() + w3 * p3.d();
+        return new Rotation(MathHelper.wrapDegrees(yaw), MathHelper.clamp(pitch, -90.0f, 90.0f));
     }
 
     private boolean applyRotationStep(Rotation rotation, float turnSpeed, boolean bait) {
