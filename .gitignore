@@ -1,1 +1,3 @@
-(empty)
+# Gradle build cache and artifacts
+.gradle/
+build/
